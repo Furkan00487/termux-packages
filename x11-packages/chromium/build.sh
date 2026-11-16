@@ -109,6 +109,8 @@ EOF
 	# Install amd64 rootfs
 	build/linux/sysroot_scripts/install-sysroot.py --arch=amd64
 	local _amd64_sysroot_path="$(pwd)/build/linux/$(ls build/linux | grep 'amd64-sysroot')"
+	mkdir -p "$_amd64_sysroot_path/data/data/com.termux/files"
+	ln -sfn ../../../../usr "$_amd64_sysroot_path/data/data/com.termux/files/usr"
 
 	# Setup rust toolchain and clang toolchain
 	./tools/rust/update_rust.py
@@ -342,8 +344,10 @@ v8_use_metagen = false
 termux_step_make() {
 	cd $TERMUX_PKG_BUILDDIR
 
+	local _jobs="${TERMUX_PKG_MAKE_PROCESSES:-3}"
+
 	# Build v8 snapshot in another action
-	time ninja -C out/Release \
+	time ninja -C out/Release -j"$_jobs" \
 						v8_context_snapshot \
 						run_mksnapshot_default \
 						run_torque \
@@ -351,7 +355,7 @@ termux_step_make() {
 						v8:run_gen-regexp-special-case
 
 	# Build generate steps in another action
-	time ninja -C out/Release \
+	time ninja -C out/Release -j"$_jobs" \
 						generate_top_domain_list_variables_file \
 						generate_chrome_colors_info \
 						character_data \
@@ -360,18 +364,13 @@ termux_step_make() {
 						generate_transport_security_state_pins \
 						generate_top_domains_trie
 
-	# Build swiftshader in another action
-	time ninja -C out/Release \
-						third_party/swiftshader/src/Vulkan:icd_file \
-						third_party/swiftshader/src/Vulkan:swiftshader_libvulkan
-
 	# Build pdfium in another action
-	time ninja -C out/Release \
+	time ninja -C out/Release -j"$_jobs" \
 						third_party/pdfium \
 						third_party/pdfium:pdfium_public_headers
 
 	# Build other components
-	ninja -C out/Release chromedriver chrome chrome_crashpad_handler headless_shell
+	ninja -C out/Release -j"$_jobs" chromedriver chrome chrome_crashpad_handler headless_shell
 }
 
 termux_step_make_install() {
@@ -409,12 +408,7 @@ termux_step_make_install() {
 		libEGL.so
 		libGLESv2.so
 
-		# Vulkan
-		libvulkan.so.1
-		libVkICD_mock_icd.so
-		libvk_swiftshader.so
-		# libVkLayer_khronos_validation.so
-		vk_swiftshader_icd.json
+		# Android system /system/lib64/libvulkan.so is loaded directly (no bundled SwiftShader ICD)
 
 		# FFmpeg
 		libffmpeg.so

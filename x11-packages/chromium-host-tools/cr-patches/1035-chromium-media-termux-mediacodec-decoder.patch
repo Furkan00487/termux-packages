@@ -1,0 +1,648 @@
+--- a/media/filters/BUILD.gn
++++ b/media/filters/BUILD.gn
+@@ -232,6 +232,8 @@
+       sources += [
+         "ffmpeg_video_decoder.cc",
+         "ffmpeg_video_decoder.h",
++        "termux_mediacodec_video_decoder.cc",
++        "termux_mediacodec_video_decoder.h",
+       ]
+     }
+ 
+@@ -426,7 +428,10 @@
+     }
+ 
+     if (enable_ffmpeg_video_decoders && proprietary_codecs) {
+-      sources += [ "ffmpeg_video_decoder_unittest.cc" ]
++      sources += [
++        "ffmpeg_video_decoder_unittest.cc",
++        "termux_mediacodec_video_decoder_unittest.cc",
++      ]
+     }
+   }
+ 
+--- a/media/renderers/default_decoder_factory.cc
++++ b/media/renderers/default_decoder_factory.cc
+@@ -38,6 +38,7 @@
+ 
+ #if BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
+ #include "media/filters/ffmpeg_video_decoder.h"
++#include "media/filters/termux_mediacodec_video_decoder.h"
+ #endif
+ 
+ #if BUILDFLAG(ENABLE_LIBVPX)
+@@ -145,6 +146,11 @@
+         std::move(request_overlay_info_cb), target_color_space, video_decoders);
+   }
+ 
++#if defined(__TERMUX__) && BUILDFLAG(ENABLE_FFMPEG_VIDEO_DECODERS)
++  video_decoders->push_back(
++      std::make_unique<TermuxMediaCodecVideoDecoder>(media_log->Clone()));
++#endif
++
+ #if BUILDFLAG(ENABLE_LIBVPX)
+   video_decoders->push_back(std::make_unique<OffloadingVpxVideoDecoder>());
+ #endif
+--- a/media/filters/termux_mediacodec_video_decoder.h
++++ b/media/filters/termux_mediacodec_video_decoder.h
+@@ -0,0 +1,78 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_FILTERS_TERMUX_MEDIACODEC_VIDEO_DECODER_H_
++#define MEDIA_FILTERS_TERMUX_MEDIACODEC_VIDEO_DECODER_H_
++
++#include <memory>
++
++#include "base/containers/queue.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/sequence_checker.h"
++#include "media/base/media_export.h"
++#include "media/base/video_decoder.h"
++#include "media/base/video_decoder_config.h"
++
++namespace media {
++
++class MediaLog;
++
++// Hardware-accelerated video decoder backed by Android NDK libmediandk.so
++// (AMediaCodec) for Termux Bionic builds. Targets codecs backed by vendor
++// hardware decoders (e.g. H.264, HEVC, VP8 on Exynos) and cleanly declines
++// unsupported codecs (VP9, AV1) or encrypted streams so Chromium falls back to
++// libvpx / dav1d / FFmpeg.
++class MEDIA_EXPORT TermuxMediaCodecVideoDecoder : public VideoDecoder {
++ public:
++  static bool IsCodecSupported(VideoCodec codec);
++
++  explicit TermuxMediaCodecVideoDecoder(std::unique_ptr<MediaLog> media_log);
++
++  TermuxMediaCodecVideoDecoder(const TermuxMediaCodecVideoDecoder&) = delete;
++  TermuxMediaCodecVideoDecoder& operator=(const TermuxMediaCodecVideoDecoder&) =
++      delete;
++
++  ~TermuxMediaCodecVideoDecoder() override;
++
++  // VideoDecoder implementation.
++  VideoDecoderType GetDecoderType() const override;
++  bool NeedsBitstreamConversion() const override;
++  void Initialize(const VideoDecoderConfig& config,
++                  bool low_delay,
++                  CdmContext* cdm_context,
++                  InitCB init_cb,
++                  const OutputCB& output_cb,
++                  const WaitingCB& waiting_cb) override;
++  void Decode(scoped_refptr<DecoderBuffer> buffer, DecodeCB decode_cb) override;
++  void Reset(base::OnceClosure closure) override;
++
++ private:
++  struct CodecHandle;
++
++  void ReleaseCodec();
++  void DrainOutputBuffers(bool draining_eos);
++  scoped_refptr<VideoFrame> CopyOutputFrame(const uint8_t* data,
++                                            size_t size,
++                                            base::TimeDelta pts);
++
++  SEQUENCE_CHECKER(sequence_checker_);
++
++  const std::unique_ptr<MediaLog> media_log_;
++  VideoDecoderConfig config_;
++  OutputCB output_cb_;
++  std::unique_ptr<CodecHandle> codec_;
++
++  int32_t out_width_ = 0;
++  int32_t out_height_ = 0;
++  int32_t out_stride_ = 0;
++  int32_t out_slice_height_ = 0;
++  int32_t out_color_format_ = 21;  // COLOR_FormatYUV420SemiPlanar (NV12)
++  bool initialized_ = false;
++  bool eos_seen_ = false;
++};
++
++}  // namespace media
++
++#endif  // MEDIA_FILTERS_TERMUX_MEDIACODEC_VIDEO_DECODER_H_
+--- a/media/filters/termux_mediacodec_video_decoder.cc
++++ b/media/filters/termux_mediacodec_video_decoder.cc
+@@ -0,0 +1,470 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/filters/termux_mediacodec_video_decoder.h"
++
++#include <dlfcn.h>
++#include <algorithm>
++
++#include "base/containers/span.h"
++#include <cstring>
++
++#include "base/compiler_specific.h"
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/task/sequenced_task_runner.h"
++#include "media/base/decoder_buffer.h"
++#include "media/base/media_log.h"
++#include "media/base/video_frame.h"
++
++namespace media {
++namespace {
++
++struct AMediaCodec;
++struct AMediaFormat;
++
++struct TermuxBufferInfo {
++  int32_t offset;
++  int32_t size;
++  int64_t presentationTimeUs;
++  uint32_t flags;
++};
++
++constexpr uint32_t kBufferFlagEndOfStream = 4;
++constexpr ssize_t kInfoTryAgainLater = -1;
++constexpr ssize_t kInfoOutputFormatChanged = -2;
++constexpr ssize_t kInfoOutputBuffersChanged = -3;
++constexpr int32_t kColorFormatYUV420Planar = 19;
++constexpr int32_t kColorFormatYUV420SemiPlanar = 21;
++
++struct MediaNdkApi {
++  using PFN_format_new = AMediaFormat* (*)();
++  using PFN_format_delete = int (*)(AMediaFormat*);
++  using PFN_format_set_string = void (*)(AMediaFormat*, const char*, const char*);
++  using PFN_format_set_int32 = void (*)(AMediaFormat*, const char*, int32_t);
++  using PFN_format_set_buffer = void (*)(AMediaFormat*, const char*, const void*, size_t);
++  using PFN_format_get_int32 = bool (*)(AMediaFormat*, const char*, int32_t*);
++
++  using PFN_create_decoder = AMediaCodec* (*)(const char*);
++  using PFN_delete = int (*)(AMediaCodec*);
++  using PFN_configure = int (*)(AMediaCodec*, const AMediaFormat*, void*, void*, uint32_t);
++  using PFN_start = int (*)(AMediaCodec*);
++  using PFN_stop = int (*)(AMediaCodec*);
++  using PFN_flush = int (*)(AMediaCodec*);
++  using PFN_dequeue_in = ssize_t (*)(AMediaCodec*, int64_t);
++  using PFN_get_in_buf = uint8_t* (*)(AMediaCodec*, size_t, size_t*);
++  using PFN_queue_in = int (*)(AMediaCodec*, size_t, off_t, size_t, uint64_t, uint32_t);
++  using PFN_dequeue_out = ssize_t (*)(AMediaCodec*, TermuxBufferInfo*, int64_t);
++  using PFN_get_out_buf = uint8_t* (*)(AMediaCodec*, size_t, size_t*);
++  using PFN_get_out_fmt = AMediaFormat* (*)(AMediaCodec*);
++  using PFN_release_out = int (*)(AMediaCodec*, size_t, bool);
++
++  PFN_format_new format_new = nullptr;
++  PFN_format_delete format_delete = nullptr;
++  PFN_format_set_string format_set_string = nullptr;
++  PFN_format_set_int32 format_set_int32 = nullptr;
++  PFN_format_set_buffer format_set_buffer = nullptr;
++  PFN_format_get_int32 format_get_int32 = nullptr;
++  PFN_create_decoder create_decoder = nullptr;
++  PFN_delete codec_delete = nullptr;
++  PFN_configure configure = nullptr;
++  PFN_start start = nullptr;
++  PFN_stop stop = nullptr;
++  PFN_flush flush = nullptr;
++  PFN_dequeue_in dequeue_in = nullptr;
++  PFN_get_in_buf get_in_buf = nullptr;
++  PFN_queue_in queue_in = nullptr;
++  PFN_dequeue_out dequeue_out = nullptr;
++  PFN_get_out_buf get_out_buf = nullptr;
++  PFN_get_out_fmt get_out_fmt = nullptr;
++  PFN_release_out release_out = nullptr;
++
++  bool tried = false;
++  bool available = false;
++
++  bool Init() {
++    if (tried) {
++      return available;
++    }
++    tried = true;
++    void* lib = dlopen("/system/lib64/libmediandk.so", RTLD_LAZY);
++    if (!lib) {
++      lib = dlopen("libmediandk.so", RTLD_LAZY);
++    }
++    if (!lib) {
++      return false;
++    }
++#define LOAD_SYM(field, name)                              \
++  field = reinterpret_cast<decltype(field)>(dlsym(lib, name)); \
++  if (!field) return false;
++    LOAD_SYM(format_new, "AMediaFormat_new")
++    LOAD_SYM(format_delete, "AMediaFormat_delete")
++    LOAD_SYM(format_set_string, "AMediaFormat_setString")
++    LOAD_SYM(format_set_int32, "AMediaFormat_setInt32")
++    LOAD_SYM(format_set_buffer, "AMediaFormat_setBuffer")
++    LOAD_SYM(format_get_int32, "AMediaFormat_getInt32")
++    LOAD_SYM(create_decoder, "AMediaCodec_createDecoderByType")
++    LOAD_SYM(codec_delete, "AMediaCodec_delete")
++    LOAD_SYM(configure, "AMediaCodec_configure")
++    LOAD_SYM(start, "AMediaCodec_start")
++    LOAD_SYM(stop, "AMediaCodec_stop")
++    LOAD_SYM(flush, "AMediaCodec_flush")
++    LOAD_SYM(dequeue_in, "AMediaCodec_dequeueInputBuffer")
++    LOAD_SYM(get_in_buf, "AMediaCodec_getInputBuffer")
++    LOAD_SYM(queue_in, "AMediaCodec_queueInputBuffer")
++    LOAD_SYM(dequeue_out, "AMediaCodec_dequeueOutputBuffer")
++    LOAD_SYM(get_out_buf, "AMediaCodec_getOutputBuffer")
++    LOAD_SYM(get_out_fmt, "AMediaCodec_getOutputFormat")
++    LOAD_SYM(release_out, "AMediaCodec_releaseOutputBuffer")
++#undef LOAD_SYM
++    available = true;
++    return true;
++  }
++};
++
++MediaNdkApi& GetMediaNdk() {
++  static MediaNdkApi api;
++  return api;
++}
++
++const char* CodecToMimeType(VideoCodec codec) {
++  switch (codec) {
++    case VideoCodec::kH264:
++      return "video/avc";
++    case VideoCodec::kHEVC:
++      return "video/hevc";
++    case VideoCodec::kVP8:
++      return "video/x-vnd.on2.vp8";
++    default:
++      return nullptr;
++  }
++}
++
++void CopyPlaneRows(const uint8_t* src,
++                   int32_t src_stride,
++                   uint8_t* dst,
++                   int32_t dst_stride,
++                   int32_t row_bytes,
++                   int32_t rows) {
++  const int32_t copy_bytes = std::min({row_bytes, src_stride, dst_stride});
++  for (int32_t r = 0; r < rows; ++r) {
++    UNSAFE_TODO(std::memcpy(dst + static_cast<size_t>(r) * dst_stride,
++                            src + static_cast<size_t>(r) * src_stride,
++                            static_cast<size_t>(copy_bytes)));
++  }
++}
++
++}  // namespace
++
++struct TermuxMediaCodecVideoDecoder::CodecHandle {
++  AMediaCodec* codec = nullptr;
++  bool started = false;
++};
++
++// static
++bool TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec codec) {
++  return codec == VideoCodec::kH264 || codec == VideoCodec::kHEVC ||
++         codec == VideoCodec::kVP8;
++}
++
++TermuxMediaCodecVideoDecoder::TermuxMediaCodecVideoDecoder(
++    std::unique_ptr<MediaLog> media_log)
++    : media_log_(std::move(media_log)) {
++  DETACH_FROM_SEQUENCE(sequence_checker_);
++}
++
++TermuxMediaCodecVideoDecoder::~TermuxMediaCodecVideoDecoder() {
++  ReleaseCodec();
++}
++
++VideoDecoderType TermuxMediaCodecVideoDecoder::GetDecoderType() const {
++  return VideoDecoderType::kMediaCodec;
++}
++
++bool TermuxMediaCodecVideoDecoder::NeedsBitstreamConversion() const {
++  return config_.codec() == VideoCodec::kH264 ||
++         config_.codec() == VideoCodec::kHEVC;
++}
++
++void TermuxMediaCodecVideoDecoder::ReleaseCodec() {
++  if (!codec_) {
++    return;
++  }
++  MediaNdkApi& api = GetMediaNdk();
++  if (codec_->codec && api.available) {
++    if (codec_->started) {
++      api.stop(codec_->codec);
++    }
++    api.codec_delete(codec_->codec);
++  }
++  codec_.reset();
++  initialized_ = false;
++}
++
++void TermuxMediaCodecVideoDecoder::Initialize(const VideoDecoderConfig& config,
++                                              bool /*low_delay*/,
++                                              CdmContext* /*cdm_context*/,
++                                              InitCB init_cb,
++                                              const OutputCB& output_cb,
++                                              const WaitingCB& /*waiting_cb*/) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReleaseCodec();
++
++  if (config.is_encrypted() || !IsCodecSupported(config.codec()) ||
++      config.coded_size().IsEmpty()) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedCodec);
++    return;
++  }
++
++  // Decline 10-bit profiles so software decoders handle them cleanly.
++  if (config.profile() == H264PROFILE_HIGH10PROFILE ||
++      config.profile() == HEVCPROFILE_MAIN10) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedProfile);
++    return;
++  }
++
++  const char* mime = CodecToMimeType(config.codec());
++  MediaNdkApi& api = GetMediaNdk();
++  if (!mime || !api.Init()) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedCodec);
++    return;
++  }
++
++  AMediaFormat* fmt = api.format_new();
++  if (!fmt) {
++    std::move(init_cb).Run(DecoderStatus::Codes::kFailedToCreateDecoder);
++    return;
++  }
++  api.format_set_string(fmt, "mime", mime);
++  api.format_set_int32(fmt, "width", config.coded_size().width());
++  api.format_set_int32(fmt, "height", config.coded_size().height());
++  api.format_set_int32(fmt, "color-format", kColorFormatYUV420SemiPlanar);
++  if (!config.extra_data().empty()) {
++    api.format_set_buffer(fmt, "csd-0", config.extra_data().data(),
++                          config.extra_data().size());
++  }
++
++  AMediaCodec* raw_codec = api.create_decoder(mime);
++  if (!raw_codec) {
++    api.format_delete(fmt);
++    std::move(init_cb).Run(DecoderStatus::Codes::kFailedToCreateDecoder);
++    return;
++  }
++
++  auto handle = std::make_unique<CodecHandle>();
++  handle->codec = raw_codec;
++
++  if (api.configure(raw_codec, fmt, nullptr, nullptr, 0) != 0) {
++    api.format_delete(fmt);
++    api.codec_delete(raw_codec);
++    std::move(init_cb).Run(DecoderStatus::Codes::kUnsupportedConfig);
++    return;
++  }
++  api.format_delete(fmt);
++
++  if (api.start(raw_codec) != 0) {
++    api.codec_delete(raw_codec);
++    std::move(init_cb).Run(DecoderStatus::Codes::kFailedToCreateDecoder);
++    return;
++  }
++  handle->started = true;
++
++  codec_ = std::move(handle);
++  config_ = config;
++  output_cb_ = output_cb;
++  out_width_ = config.coded_size().width();
++  out_height_ = config.coded_size().height();
++  out_stride_ = out_width_;
++  out_slice_height_ = out_height_;
++  out_color_format_ = kColorFormatYUV420SemiPlanar;
++  initialized_ = true;
++  eos_seen_ = false;
++
++  std::move(init_cb).Run(DecoderStatus::Codes::kOk);
++}
++
++scoped_refptr<VideoFrame> TermuxMediaCodecVideoDecoder::CopyOutputFrame(
++    const uint8_t* data,
++    size_t size,
++    base::TimeDelta pts) {
++  if (!data || out_width_ <= 0 || out_height_ <= 0) {
++    return nullptr;
++  }
++
++  const gfx::Size coded_size(out_width_, out_height_);
++  const gfx::Rect visible_rect =
++      IntersectRects(config_.visible_rect(), gfx::Rect(coded_size));
++  const gfx::Size natural_size = config_.natural_size().IsEmpty()
++                                     ? visible_rect.size()
++                                     : config_.natural_size();
++
++  const int32_t stride = std::max(out_stride_, out_width_);
++  const int32_t slice_h = std::max(out_slice_height_, out_height_);
++  const size_t y_plane_bytes = static_cast<size_t>(stride) * slice_h;
++
++  if (out_color_format_ == kColorFormatYUV420Planar) {
++    const int32_t uv_stride = (stride + 1) / 2;
++    const int32_t uv_rows = (out_height_ + 1) / 2;
++    const size_t uv_plane_bytes =
++        static_cast<size_t>(uv_stride) * ((slice_h + 1) / 2);
++    if (size < y_plane_bytes + uv_plane_bytes * 2) {
++      return nullptr;
++    }
++    auto frame = VideoFrame::CreateFrame(PIXEL_FORMAT_I420, coded_size,
++                                         visible_rect, natural_size, pts);
++    if (!frame) {
++      return nullptr;
++    }
++    CopyPlaneRows(data, stride, frame->writable_data(VideoFrame::Plane::kY),
++                  frame->stride(VideoFrame::Plane::kY), out_width_, out_height_);
++    CopyPlaneRows(UNSAFE_TODO(data + y_plane_bytes), uv_stride,
++                  frame->writable_data(VideoFrame::Plane::kU),
++                  frame->stride(VideoFrame::Plane::kU), (out_width_ + 1) / 2,
++                  uv_rows);
++    CopyPlaneRows(UNSAFE_TODO(data + y_plane_bytes + uv_plane_bytes), uv_stride,
++                  frame->writable_data(VideoFrame::Plane::kV),
++                  frame->stride(VideoFrame::Plane::kV), (out_width_ + 1) / 2,
++                  uv_rows);
++    frame->set_color_space(config_.color_space_info().ToGfxColorSpace());
++    return frame;
++  }
++
++  // Default: NV12 (COLOR_FormatYUV420SemiPlanar)
++  const int32_t uv_rows = (out_height_ + 1) / 2;
++  const size_t uv_bytes = static_cast<size_t>(stride) * uv_rows;
++  if (size < y_plane_bytes + uv_bytes) {
++    return nullptr;
++  }
++  auto frame = VideoFrame::CreateFrame(PIXEL_FORMAT_NV12, coded_size,
++                                       visible_rect, natural_size, pts);
++  if (!frame) {
++    return nullptr;
++  }
++  CopyPlaneRows(data, stride, frame->writable_data(VideoFrame::Plane::kY),
++                frame->stride(VideoFrame::Plane::kY), out_width_, out_height_);
++  CopyPlaneRows(UNSAFE_TODO(data + y_plane_bytes), stride,
++                frame->writable_data(VideoFrame::Plane::kUV),
++                frame->stride(VideoFrame::Plane::kUV), out_width_, uv_rows);
++  frame->set_color_space(config_.color_space_info().ToGfxColorSpace());
++  return frame;
++}
++
++void TermuxMediaCodecVideoDecoder::DrainOutputBuffers(bool draining_eos) {
++  MediaNdkApi& api = GetMediaNdk();
++  const int max_iters = draining_eos ? 64 : 8;
++  const int64_t timeout_us = draining_eos ? 5000 : 0;
++
++  for (int i = 0; i < max_iters; ++i) {
++    TermuxBufferInfo info = {};
++    ssize_t idx = api.dequeue_out(codec_->codec, &info, timeout_us);
++    if (idx == kInfoOutputFormatChanged) {
++      AMediaFormat* fmt = api.get_out_fmt(codec_->codec);
++      if (fmt) {
++        api.format_get_int32(fmt, "width", &out_width_);
++        api.format_get_int32(fmt, "height", &out_height_);
++        api.format_get_int32(fmt, "stride", &out_stride_);
++        api.format_get_int32(fmt, "slice-height", &out_slice_height_);
++        api.format_get_int32(fmt, "color-format", &out_color_format_);
++        api.format_delete(fmt);
++      }
++      continue;
++    }
++    if (idx == kInfoOutputBuffersChanged) {
++      continue;
++    }
++    if (idx == kInfoTryAgainLater || idx < 0) {
++      if (!draining_eos || eos_seen_) {
++        break;
++      }
++      continue;
++    }
++
++    size_t out_buf_size = 0;
++    uint8_t* out_ptr =
++        api.get_out_buf(codec_->codec, static_cast<size_t>(idx), &out_buf_size);
++    if (out_ptr && info.size > 0 &&
++        static_cast<size_t>(info.offset + info.size) <= out_buf_size) {
++      auto frame = CopyOutputFrame(
++          UNSAFE_TODO(out_ptr + info.offset), static_cast<size_t>(info.size),
++          base::Microseconds(info.presentationTimeUs));
++      if (frame && output_cb_) {
++        output_cb_.Run(std::move(frame));
++      }
++    }
++    api.release_out(codec_->codec, static_cast<size_t>(idx), false);
++
++    if ((info.flags & kBufferFlagEndOfStream) != 0) {
++      eos_seen_ = true;
++      break;
++    }
++  }
++}
++
++void TermuxMediaCodecVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
++                                          DecodeCB decode_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!initialized_ || !codec_ || !codec_->codec) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(std::move(decode_cb), DecoderStatus::Codes::kFailed));
++    return;
++  }
++
++  MediaNdkApi& api = GetMediaNdk();
++  const bool is_eos = buffer->end_of_stream();
++  ssize_t in_idx = api.dequeue_in(codec_->codec, 20000);
++  if (in_idx < 0) {
++    DrainOutputBuffers(false);
++    in_idx = api.dequeue_in(codec_->codec, 20000);
++  }
++
++  if (in_idx < 0) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE,
++        base::BindOnce(std::move(decode_cb), DecoderStatus::Codes::kFailed));
++    return;
++  }
++
++  if (is_eos) {
++    api.queue_in(codec_->codec, static_cast<size_t>(in_idx), 0, 0, 0,
++                 kBufferFlagEndOfStream);
++    DrainOutputBuffers(/*draining_eos=*/true);
++  } else {
++    size_t in_cap = 0;
++    uint8_t* in_ptr =
++        api.get_in_buf(codec_->codec, static_cast<size_t>(in_idx), &in_cap);
++    if (!in_ptr || buffer->size() > in_cap) {
++      base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++          FROM_HERE,
++          base::BindOnce(std::move(decode_cb), DecoderStatus::Codes::kFailed));
++      return;
++    }
++    base::span<const uint8_t> src_span(*buffer);
++    UNSAFE_TODO(std::memcpy(in_ptr, src_span.data(), src_span.size()));
++    const uint64_t pts_us =
++        buffer->timestamp() == kNoTimestamp
++            ? 0
++            : static_cast<uint64_t>(
++                  std::max<int64_t>(0, buffer->timestamp().InMicroseconds()));
++    api.queue_in(codec_->codec, static_cast<size_t>(in_idx), 0, buffer->size(),
++                 pts_us, 0);
++    DrainOutputBuffers(/*draining_eos=*/false);
++  }
++
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE,
++      base::BindOnce(std::move(decode_cb), DecoderStatus::Codes::kOk));
++}
++
++void TermuxMediaCodecVideoDecoder::Reset(base::OnceClosure closure) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (initialized_ && codec_ && codec_->codec) {
++    GetMediaNdk().flush(codec_->codec);
++    eos_seen_ = false;
++  }
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++                                                          std::move(closure));
++}
++
++}  // namespace media
+--- a/media/filters/termux_mediacodec_video_decoder_unittest.cc
++++ b/media/filters/termux_mediacodec_video_decoder_unittest.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/filters/termux_mediacodec_video_decoder.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/test/task_environment.h"
++#include "media/base/media_util.h"
++#include "media/base/test_helpers.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace media {
++
++TEST(TermuxMediaCodecVideoDecoderTest, SupportedCodecsMatchExynosCapabilities) {
++  EXPECT_TRUE(TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec::kH264));
++  EXPECT_TRUE(TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec::kHEVC));
++  EXPECT_TRUE(TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec::kVP8));
++  EXPECT_FALSE(TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec::kVP9));
++  EXPECT_FALSE(TermuxMediaCodecVideoDecoder::IsCodecSupported(VideoCodec::kAV1));
++}
++
++TEST(TermuxMediaCodecVideoDecoderTest, DecoderTypeAndBitstreamConversion) {
++  base::test::SingleThreadTaskEnvironment env;
++  TermuxMediaCodecVideoDecoder decoder(std::make_unique<NullMediaLog>());
++  EXPECT_EQ(decoder.GetDecoderType(), VideoDecoderType::kMediaCodec);
++
++  DecoderStatus init_status = DecoderStatus::Codes::kOk;
++  decoder.Initialize(
++      TestVideoConfig::Normal(VideoCodec::kVP9), false, nullptr,
++      base::BindOnce([](DecoderStatus* out, DecoderStatus s) { *out = s; },
++                     &init_status),
++      base::DoNothing(), base::NullCallback());
++  EXPECT_FALSE(init_status.is_ok());
++
++  DecoderStatus enc_status = DecoderStatus::Codes::kOk;
++  decoder.Initialize(
++      TestVideoConfig::NormalEncrypted(VideoCodec::kH264), false, nullptr,
++      base::BindOnce([](DecoderStatus* out, DecoderStatus s) { *out = s; },
++                     &enc_status),
++      base::DoNothing(), base::NullCallback());
++  EXPECT_FALSE(enc_status.is_ok());
++}
++
++}  // namespace media
