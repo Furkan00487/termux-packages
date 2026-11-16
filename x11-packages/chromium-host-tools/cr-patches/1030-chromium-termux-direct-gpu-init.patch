@@ -1,0 +1,26 @@
+--- a/ui/ozone/platform/x11/vulkan_implementation_x11.cc	2026-11-16 04:49:56.532845278 +0000
++++ b/ui/ozone/platform/x11/vulkan_implementation_x11.cc	2026-11-16 04:49:56.532845278 +0000
+@@ -35,6 +35,11 @@
+ bool VulkanImplementationX11::InitializeVulkanInstance(bool using_surface) {
+   if (using_surface && !use_swiftshader() && !ui::IsVulkanSurfaceSupported())
+     using_surface = false;
++#if defined(__TERMUX__)
++  // Android vendor libvulkan.so (e.g. Mali-G68) exposes VK_KHR_android_surface,
++  // not VK_KHR_xcb_surface. Window surfaces go through ANGLE-Vulkan AHB+DRI3.
++  using_surface = false;
++#endif
+   using_surface_ = using_surface;
+   // Unset DISPLAY env, so the vulkan can be initialized successfully, if the X
+   // server doesn't support Vulkan surface.
+@@ -59,7 +64,11 @@
+ 
+     path = path.Append("libvk_swiftshader.so");
+   } else {
++#if defined(__TERMUX__)
++    path = base::FilePath("/system/lib64/libvulkan.so");
++#else
+     path = base::FilePath("libvulkan.so.1");
++#endif
+   }
+ 
+   return vulkan_instance_.Initialize(path, required_extensions, {});

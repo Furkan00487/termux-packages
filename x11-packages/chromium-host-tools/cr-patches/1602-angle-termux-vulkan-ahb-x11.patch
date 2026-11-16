@@ -1,0 +1,746 @@
+--- a/third_party/angle/src/common/vulkan/libvulkan_loader.cpp	2026-11-16 04:49:56.533845278 +0000
++++ b/third_party/angle/src/common/vulkan/libvulkan_loader.cpp	2026-11-16 04:49:56.533845278 +0000
+@@ -26,6 +26,10 @@
+         // in the "Libraries/" subdirectory but the host module (containing ANGLE)
+         // is in the parent directory.
+         "Libraries/libvulkan.dylib", "Libraries/libvulkan.1.dylib", "Libraries/libMoltenVK.dylib"
++#elif defined(__TERMUX__)
++        "/system/lib64/libvulkan.so",
++        "libvulkan.so",
++        "libvulkan.so.1",
+ #else
+         "libvulkan.so",
+         "libvulkan.so.1",
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/vk_renderer.cpp	2026-11-16 04:49:56.534845278 +0000
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/vk_renderer.cpp	2026-11-16 05:45:49.358810603 +0000
+@@ -3969,12 +3969,12 @@
+         mEnabledDeviceExtensions.push_back(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
+     }
+ 
+-#if defined(ANGLE_PLATFORM_ANDROID)
++#if defined(ANGLE_PLATFORM_ANDROID) || defined(__TERMUX__)
+     if (mFeatures.supportsAndroidHardwareBuffer.enabled)
+     {
+         mEnabledDeviceExtensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+         mEnabledDeviceExtensions.push_back(
+-            VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
++            "VK_ANDROID_external_memory_android_hardware_buffer");
+     }
+ #else
+     ASSERT(!mFeatures.supportsAndroidHardwareBuffer.enabled);
+@@ -5777,11 +5777,11 @@
+         &mFeatures, supportsIncrementalPresent,
+         ExtensionFound(VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME, deviceExtensionNames));
+ 
+-#if defined(ANGLE_PLATFORM_ANDROID)
++#if defined(ANGLE_PLATFORM_ANDROID) || defined(__TERMUX__)
+     ANGLE_FEATURE_CONDITION(
+         &mFeatures, supportsAndroidHardwareBuffer,
+-        IsAndroid() &&
+-            ExtensionFound(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
++        (IsAndroid() || true) &&
++            ExtensionFound("VK_ANDROID_external_memory_android_hardware_buffer",
+                            deviceExtensionNames) &&
+             ExtensionFound(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, deviceExtensionNames));
+ #endif
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/DisplayVkXcb.cpp	2026-11-16 04:49:56.535845278 +0000
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/DisplayVkXcb.cpp	2026-11-16 04:49:56.535845278 +0000
+@@ -101,7 +101,11 @@
+ 
+ egl::ConfigSet DisplayVkXcb::generateConfigs()
+ {
++#if defined(__TERMUX__)
++    const std::array<GLenum, 2> kColorFormats = {GL_BGRA8_EXT, GL_RGBA8};
++#else
+     const std::array<GLenum, 1> kColorFormats = {GL_BGRA8_EXT};
++#endif
+ 
+     std::vector<GLenum> depthStencilFormats(
+         egl_vk::kConfigDepthStencilFormats,
+@@ -143,7 +147,11 @@
+ 
+ const char *DisplayVkXcb::getWSIExtension() const
+ {
++#if defined(__TERMUX__)
++    return nullptr;
++#else
+     return VK_KHR_XCB_SURFACE_EXTENSION_NAME;
++#endif
+ }
+ 
+ bool IsVulkanXcbDisplayAvailable()
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.h	2026-11-16 04:49:56.536845278 +0000
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.h	2026-11-16 04:49:56.536845278 +0000
+@@ -13,10 +13,56 @@
+ #include "libANGLE/renderer/vulkan/SurfaceVk.h"
+ 
+ struct xcb_connection_t;
++#if defined(__TERMUX__)
++struct AHardwareBuffer;
++#endif
+ 
+ namespace rx
+ {
+ 
++#if defined(__TERMUX__)
++class WindowSurfaceVkXcb : public OffscreenSurfaceVk
++{
++  public:
++    WindowSurfaceVkXcb(const egl::SurfaceState &surfaceState,
++                       EGLNativeWindowType window,
++                       xcb_connection_t *conn);
++    ~WindowSurfaceVkXcb() override;
++
++    egl::Error initialize(const egl::Display *display) override;
++    void destroy(const egl::Display *display) override;
++    egl::Error swap(const gl::Context *context, SurfaceSwapFeedback *feedback) override;
++
++  private:
++    struct AhbSlot
++    {
++        AHardwareBuffer *ahb  = nullptr;
++        VkImage vkImage       = VK_NULL_HANDLE;
++        VkDeviceMemory vkMem  = VK_NULL_HANDLE;
++        uint32_t pixmap       = 0;
++        uint32_t stride       = 0;
++        bool initialized      = false;
++    };
++
++    bool queryWindowGeometry(int32_t *outWidth, int32_t *outHeight) const;
++    bool ensureAhbRing(vk::Renderer *renderer);
++    void destroyAhbRing(VkDevice device);
++    bool presentViaDri3(vk::Renderer *renderer, vk::ImageHelper *srcImage);
++    bool presentViaPutImage(const gl::Context *context);
++
++    xcb_connection_t *mXcbConnection;
++    uint32_t mWindow;
++    uint32_t mGc = 0;
++    VkCommandPool mCmdPool = VK_NULL_HANDLE;
++    VkCommandBuffer mCmdBuf = VK_NULL_HANDLE;
++    VkFence mFence = VK_NULL_HANDLE;
++    static constexpr size_t kRingSize = 2;
++    AhbSlot mRing[kRingSize];
++    size_t mRingIndex = 0;
++    uint32_t mPresentSerial = 1;
++    bool mDri3Failed = false;
++};
++#else
+ class WindowSurfaceVkXcb : public WindowSurfaceVk
+ {
+   public:
+@@ -32,6 +78,7 @@
+ 
+     xcb_connection_t *mXcbConnection;
+ };
++#endif
+ 
+ }  // namespace rx
+ 
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.cpp	2026-11-16 04:49:56.536845278 +0000
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.cpp	2026-11-16 05:46:53.132809943 +0000
+@@ -11,6 +11,591 @@
+ 
+ #include "libANGLE/renderer/vulkan/vk_renderer.h"
+ 
++#if defined(__TERMUX__)
++#include <android/hardware_buffer.h>
++#include <dlfcn.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#include <vulkan/vulkan_android.h>
++#include <xcb/dri3.h>
++#include <xcb/present.h>
++#include <xcb/xcb.h>
++
++#include "libANGLE/Context.h"
++#include "libANGLE/Display.h"
++#include "libANGLE/renderer/vulkan/ContextVk.h"
++#include "libANGLE/renderer/vulkan/DisplayVk.h"
++
++namespace rx
++{
++namespace
++{
++struct TermuxAhbApi
++{
++    using PFN_allocate = int (*)(const AHardwareBuffer_Desc *, AHardwareBuffer **);
++    using PFN_describe = void (*)(const AHardwareBuffer *, AHardwareBuffer_Desc *);
++    using PFN_release  = void (*)(AHardwareBuffer *);
++    using PFN_send     = int (*)(const AHardwareBuffer *, int);
++
++    using PFN_dri3_pixmap_from_buffers = xcb_void_cookie_t (*)(xcb_connection_t *,
++                                                               xcb_pixmap_t,
++                                                               xcb_drawable_t,
++                                                               uint8_t,
++                                                               uint16_t,
++                                                               uint16_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint32_t,
++                                                               uint8_t,
++                                                               uint8_t,
++                                                               uint64_t,
++                                                               const int32_t *);
++    using PFN_present_pixmap = xcb_void_cookie_t (*)(xcb_connection_t *,
++                                                     xcb_window_t,
++                                                     xcb_pixmap_t,
++                                                     uint32_t,
++                                                     xcb_xfixes_region_t,
++                                                     xcb_xfixes_region_t,
++                                                     int16_t,
++                                                     int16_t,
++                                                     xcb_randr_crtc_t,
++                                                     xcb_sync_fence_t,
++                                                     xcb_sync_fence_t,
++                                                     uint32_t,
++                                                     uint64_t,
++                                                     uint64_t,
++                                                     uint64_t,
++                                                     uint32_t,
++                                                     const xcb_present_notify_t *);
++
++    PFN_allocate allocate   = nullptr;
++    PFN_describe describe   = nullptr;
++    PFN_release release     = nullptr;
++    PFN_send sendHandle     = nullptr;
++    PFN_dri3_pixmap_from_buffers dri3PixmapFromBuffers = nullptr;
++    PFN_present_pixmap presentPixmap                   = nullptr;
++    bool loaded             = false;
++
++    bool init()
++    {
++        if (loaded)
++        {
++            return allocate && describe && release && sendHandle && dri3PixmapFromBuffers &&
++                   presentPixmap;
++        }
++        loaded       = true;
++        void *libAnd = dlopen("libandroid.so", RTLD_LAZY);
++        if (!libAnd)
++        {
++            libAnd = dlopen("/system/lib64/libandroid.so", RTLD_LAZY);
++        }
++        if (libAnd)
++        {
++            allocate   = reinterpret_cast<PFN_allocate>(dlsym(libAnd, "AHardwareBuffer_allocate"));
++            describe   = reinterpret_cast<PFN_describe>(dlsym(libAnd, "AHardwareBuffer_describe"));
++            release    = reinterpret_cast<PFN_release>(dlsym(libAnd, "AHardwareBuffer_release"));
++            sendHandle = reinterpret_cast<PFN_send>(
++                dlsym(libAnd, "AHardwareBuffer_sendHandleToUnixSocket"));
++        }
++        void *libDri3 = dlopen("libxcb-dri3.so", RTLD_LAZY);
++        if (libDri3)
++        {
++            dri3PixmapFromBuffers = reinterpret_cast<PFN_dri3_pixmap_from_buffers>(
++                dlsym(libDri3, "xcb_dri3_pixmap_from_buffers"));
++        }
++        void *libPres = dlopen("libxcb-present.so", RTLD_LAZY);
++        if (libPres)
++        {
++            presentPixmap =
++                reinterpret_cast<PFN_present_pixmap>(dlsym(libPres, "xcb_present_pixmap"));
++        }
++        return allocate && describe && release && sendHandle && dri3PixmapFromBuffers &&
++               presentPixmap;
++    }
++};
++
++TermuxAhbApi &GetTermuxAhbApi()
++{
++    static TermuxAhbApi api;
++    return api;
++}
++
++uint32_t FindMemoryTypeIndex(const VkPhysicalDeviceMemoryProperties &memProps,
++                             uint32_t typeBits,
++                             VkMemoryPropertyFlags required)
++{
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
++    {
++        if ((typeBits & (1u << i)) != 0 &&
++            (memProps.memoryTypes[i].propertyFlags & required) == required)
++        {
++            return i;
++        }
++    }
++    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
++    {
++        if ((typeBits & (1u << i)) != 0)
++        {
++            return i;
++        }
++    }
++    return UINT32_MAX;
++}
++}  // namespace
++
++WindowSurfaceVkXcb::WindowSurfaceVkXcb(const egl::SurfaceState &surfaceState,
++                                       EGLNativeWindowType window,
++                                       xcb_connection_t *conn)
++    : OffscreenSurfaceVk(surfaceState, nullptr),
++      mXcbConnection(conn),
++      mWindow(static_cast<uint32_t>(window))
++{}
++
++WindowSurfaceVkXcb::~WindowSurfaceVkXcb() = default;
++
++bool WindowSurfaceVkXcb::queryWindowGeometry(int32_t *outWidth, int32_t *outHeight) const
++{
++    xcb_get_geometry_cookie_t cookie = xcb_get_geometry(mXcbConnection, mWindow);
++    xcb_generic_error_t *error       = nullptr;
++    xcb_get_geometry_reply_t *reply  = xcb_get_geometry_reply(mXcbConnection, cookie, &error);
++    if (error)
++    {
++        free(error);
++        return false;
++    }
++    if (!reply)
++    {
++        return false;
++    }
++    *outWidth  = reply->width > 0 ? static_cast<int32_t>(reply->width) : 1;
++    *outHeight = reply->height > 0 ? static_cast<int32_t>(reply->height) : 1;
++    free(reply);
++    return true;
++}
++
++egl::Error WindowSurfaceVkXcb::initialize(const egl::Display *display)
++{
++    int32_t w = 1;
++    int32_t h = 1;
++    if (!queryWindowGeometry(&w, &h))
++    {
++        return egl::Error(EGL_BAD_NATIVE_WINDOW);
++    }
++    mWidth  = w;
++    mHeight = h;
++    return OffscreenSurfaceVk::initialize(display);
++}
++
++void WindowSurfaceVkXcb::destroyAhbRing(VkDevice device)
++{
++    TermuxAhbApi &api = GetTermuxAhbApi();
++    for (size_t i = 0; i < kRingSize; ++i)
++    {
++        if (mRing[i].pixmap != 0 && mXcbConnection)
++        {
++            xcb_free_pixmap(mXcbConnection, mRing[i].pixmap);
++            mRing[i].pixmap = 0;
++        }
++        if (device != VK_NULL_HANDLE)
++        {
++            if (mRing[i].vkImage != VK_NULL_HANDLE)
++            {
++                vkDestroyImage(device, mRing[i].vkImage, nullptr);
++                mRing[i].vkImage = VK_NULL_HANDLE;
++            }
++            if (mRing[i].vkMem != VK_NULL_HANDLE)
++            {
++                vkFreeMemory(device, mRing[i].vkMem, nullptr);
++                mRing[i].vkMem = VK_NULL_HANDLE;
++            }
++        }
++        if (mRing[i].ahb && api.release)
++        {
++            api.release(mRing[i].ahb);
++            mRing[i].ahb = nullptr;
++        }
++        mRing[i].stride      = 0;
++        mRing[i].initialized = false;
++    }
++    if (mXcbConnection)
++    {
++        xcb_flush(mXcbConnection);
++    }
++}
++
++void WindowSurfaceVkXcb::destroy(const egl::Display *display)
++{
++    VkDevice device = vk::GetImpl(display)->getRenderer()->getDevice();
++    if (device != VK_NULL_HANDLE)
++    {
++        vkDeviceWaitIdle(device);
++    }
++    destroyAhbRing(device);
++    if (device != VK_NULL_HANDLE)
++    {
++        if (mFence != VK_NULL_HANDLE)
++        {
++            vkDestroyFence(device, mFence, nullptr);
++            mFence = VK_NULL_HANDLE;
++        }
++        if (mCmdPool != VK_NULL_HANDLE)
++        {
++            vkDestroyCommandPool(device, mCmdPool, nullptr);
++            mCmdPool = VK_NULL_HANDLE;
++            mCmdBuf  = VK_NULL_HANDLE;
++        }
++    }
++    if (mGc != 0 && mXcbConnection)
++    {
++        xcb_free_gc(mXcbConnection, mGc);
++        mGc = 0;
++    }
++    OffscreenSurfaceVk::destroy(display);
++}
++
++bool WindowSurfaceVkXcb::ensureAhbRing(vk::Renderer *renderer)
++{
++    if (mDri3Failed)
++    {
++        return false;
++    }
++    if (mRing[0].ahb != nullptr && mRing[0].vkImage != VK_NULL_HANDLE)
++    {
++        return true;
++    }
++
++    TermuxAhbApi &api = GetTermuxAhbApi();
++    if (!api.init() || !renderer->getFeatures().supportsAndroidHardwareBuffer.enabled)
++    {
++        mDri3Failed = true;
++        return false;
++    }
++
++    VkDevice device = renderer->getDevice();
++    auto pfnGetAhbProps = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
++        vkGetDeviceProcAddr(device, "vkGetAndroidHardwareBufferPropertiesANDROID"));
++    if (!pfnGetAhbProps)
++    {
++        mDri3Failed = true;
++        return false;
++    }
++
++    if (mCmdPool == VK_NULL_HANDLE)
++    {
++        VkCommandPoolCreateInfo poolInfo = {};
++        poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++        poolInfo.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        poolInfo.queueFamilyIndex = renderer->getQueueFamilyIndex();
++        if (vkCreateCommandPool(device, &poolInfo, nullptr, &mCmdPool) != VK_SUCCESS)
++        {
++            mDri3Failed = true;
++            return false;
++        }
++
++        VkCommandBufferAllocateInfo allocInfo = {};
++        allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        allocInfo.commandPool        = mCmdPool;
++        allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        allocInfo.commandBufferCount = 1;
++        if (vkAllocateCommandBuffers(device, &allocInfo, &mCmdBuf) != VK_SUCCESS)
++        {
++            mDri3Failed = true;
++            return false;
++        }
++
++        VkFenceCreateInfo fenceInfo = {};
++        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++        if (vkCreateFence(device, &fenceInfo, nullptr, &mFence) != VK_SUCCESS)
++        {
++            mDri3Failed = true;
++            return false;
++        }
++    }
++
++    VkPhysicalDeviceMemoryProperties memProps = {};
++    vkGetPhysicalDeviceMemoryProperties(renderer->getPhysicalDevice(), &memProps);
++
++    for (size_t i = 0; i < kRingSize; ++i)
++    {
++        AHardwareBuffer_Desc desc = {};
++        desc.width  = static_cast<uint32_t>(mWidth);
++        desc.height = static_cast<uint32_t>(mHeight);
++        desc.layers = 1;
++        desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
++        desc.usage  = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
++                     AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER;
++
++        if (api.allocate(&desc, &mRing[i].ahb) != 0 || !mRing[i].ahb)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++        api.describe(mRing[i].ahb, &desc);
++        mRing[i].stride = desc.stride;
++
++        VkExternalMemoryImageCreateInfo extImgInfo = {};
++        extImgInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++        extImgInfo.handleTypes =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
++
++        VkImageCreateInfo imgInfo = {};
++        imgInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++        imgInfo.pNext         = &extImgInfo;
++        imgInfo.imageType     = VK_IMAGE_TYPE_2D;
++        imgInfo.format        = VK_FORMAT_R8G8B8A8_UNORM;
++        imgInfo.extent        = {static_cast<uint32_t>(mWidth), static_cast<uint32_t>(mHeight), 1};
++        imgInfo.mipLevels     = 1;
++        imgInfo.arrayLayers   = 1;
++        imgInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
++        imgInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
++        imgInfo.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++        imgInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
++        imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++
++        if (vkCreateImage(device, &imgInfo, nullptr, &mRing[i].vkImage) != VK_SUCCESS)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++
++        VkAndroidHardwareBufferPropertiesANDROID ahbProps = {};
++        ahbProps.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
++        if (pfnGetAhbProps(device, mRing[i].ahb, &ahbProps) != VK_SUCCESS)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++
++        uint32_t memType = FindMemoryTypeIndex(memProps, ahbProps.memoryTypeBits, 0);
++        if (memType == UINT32_MAX)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++
++        VkImportAndroidHardwareBufferInfoANDROID importInfo = {};
++        importInfo.sType  = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
++        importInfo.buffer = mRing[i].ahb;
++
++        VkMemoryDedicatedAllocateInfo dedicatedInfo = {};
++        dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++        dedicatedInfo.pNext = &importInfo;
++        dedicatedInfo.image = mRing[i].vkImage;
++
++        VkMemoryAllocateInfo memAlloc = {};
++        memAlloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        memAlloc.pNext           = &dedicatedInfo;
++        memAlloc.allocationSize  = ahbProps.allocationSize;
++        memAlloc.memoryTypeIndex = memType;
++
++        if (vkAllocateMemory(device, &memAlloc, nullptr, &mRing[i].vkMem) != VK_SUCCESS ||
++            vkBindImageMemory(device, mRing[i].vkImage, mRing[i].vkMem, 0) != VK_SUCCESS)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++
++        int sv[2] = {-1, -1};
++        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
++        {
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++
++        xcb_pixmap_t pixmap = xcb_generate_id(mXcbConnection);
++        // Modifier 1255 = AHARDWAREBUFFER_SOCKET_FD in Termux:X11 (Lorie) InitOutput.c
++        xcb_void_cookie_t ck = api.dri3PixmapFromBuffers(
++            mXcbConnection, pixmap, mWindow, 1, static_cast<uint16_t>(mWidth),
++            static_cast<uint16_t>(mHeight), desc.stride * 4, 0, 0, 0, 0, 0, 0, 32, 24,
++            1255ULL, &sv[1]);
++        xcb_flush(mXcbConnection);
++
++        uint8_t ack = 0;
++        ssize_t n   = read(sv[0], &ack, 1);
++        int sendRes = (n == 1) ? api.sendHandle(mRing[i].ahb, sv[0]) : -1;
++        close(sv[0]);
++
++        xcb_generic_error_t *driErr = xcb_request_check(mXcbConnection, ck);
++        if (driErr || n != 1 || sendRes != 0)
++        {
++            free(driErr);
++            xcb_free_pixmap(mXcbConnection, pixmap);
++            destroyAhbRing(device);
++            mDri3Failed = true;
++            return false;
++        }
++        mRing[i].pixmap      = pixmap;
++        mRing[i].initialized = false;
++    }
++
++    return true;
++}
++
++bool WindowSurfaceVkXcb::presentViaDri3(vk::Renderer *renderer, vk::ImageHelper *srcImage)
++{
++    if (!ensureAhbRing(renderer))
++    {
++        return false;
++    }
++
++    AhbSlot &slot   = mRing[mRingIndex];
++    mRingIndex      = (mRingIndex + 1) % kRingSize;
++    VkDevice device = renderer->getDevice();
++    VkQueue queue   = renderer->getQueue(egl::ContextPriority::Medium);
++
++    vkResetCommandBuffer(mCmdBuf, 0);
++    VkCommandBufferBeginInfo beginInfo = {};
++    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (vkBeginCommandBuffer(mCmdBuf, &beginInfo) != VK_SUCCESS)
++    {
++        return false;
++    }
++
++    VkImage srcVkImage        = srcImage->getImage().getHandle();
++    VkImageLayout srcOldLayout = srcImage->getCurrentLayout(renderer);
++    if (srcOldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
++    {
++        srcOldLayout = VK_IMAGE_LAYOUT_GENERAL;
++    }
++
++    VkImageMemoryBarrier barriers[2] = {};
++    barriers[0].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    barriers[0].srcAccessMask       = VK_ACCESS_MEMORY_WRITE_BIT;
++    barriers[0].dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].oldLayout           = srcOldLayout;
++    barriers[0].newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[0].image               = srcVkImage;
++    barriers[0].subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++    barriers[1].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++    barriers[1].srcAccessMask       = 0;
++    barriers[1].dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barriers[1].oldLayout =
++        slot.initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
++    barriers[1].newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    barriers[1].image               = slot.vkImage;
++    barriers[1].subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++
++    vkCmdPipelineBarrier(mCmdBuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
++
++    VkImageBlit blitRegion = {};
++    blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    blitRegion.srcOffsets[0]  = {0, 0, 0};
++    blitRegion.srcOffsets[1]  = {mWidth, mHeight, 1};
++    blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++    blitRegion.dstOffsets[0]  = {0, 0, 0};
++    blitRegion.dstOffsets[1]  = {mWidth, mHeight, 1};
++
++    vkCmdBlitImage(mCmdBuf, srcVkImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.vkImage,
++                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
++
++    barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++    barriers[0].dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
++    barriers[0].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    barriers[0].newLayout     = srcOldLayout;
++
++    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
++    barriers[1].oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    barriers[1].newLayout     = VK_IMAGE_LAYOUT_GENERAL;
++
++    vkCmdPipelineBarrier(mCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
++
++    if (vkEndCommandBuffer(mCmdBuf) != VK_SUCCESS)
++    {
++        return false;
++    }
++
++    VkSubmitInfo submitInfo = {};
++    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++    submitInfo.commandBufferCount = 1;
++    submitInfo.pCommandBuffers    = &mCmdBuf;
++
++    if (vkQueueSubmit(queue, 1, &submitInfo, mFence) != VK_SUCCESS)
++    {
++        return false;
++    }
++    vkWaitForFences(device, 1, &mFence, VK_TRUE, UINT64_MAX);
++    vkResetFences(device, 1, &mFence);
++    slot.initialized = true;
++
++    GetTermuxAhbApi().presentPixmap(mXcbConnection, mWindow, slot.pixmap, mPresentSerial++, 0, 0,
++                                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, nullptr);
++    xcb_flush(mXcbConnection);
++    return true;
++}
++
++bool WindowSurfaceVkXcb::presentViaPutImage(const gl::Context *context)
++{
++    uint8_t *pixels = nullptr;
++    EGLint pitch    = 0;
++    if (OffscreenSurfaceVk::lockSurface(context->getDisplay(), 0, true, &pixels, &pitch).isError() ||
++        !pixels)
++    {
++        return false;
++    }
++    if (mGc == 0)
++    {
++        mGc = xcb_generate_id(mXcbConnection);
++        xcb_create_gc(mXcbConnection, mGc, mWindow, 0, nullptr);
++    }
++    xcb_put_image(mXcbConnection, XCB_IMAGE_FORMAT_Z_PIXMAP, mWindow, mGc,
++                  static_cast<uint16_t>(mWidth), static_cast<uint16_t>(mHeight), 0, 0, 0, 24,
++                  static_cast<uint32_t>(pitch * mHeight), pixels);
++    xcb_flush(mXcbConnection);
++    (void)OffscreenSurfaceVk::unlockSurface(context->getDisplay(), false);
++    return true;
++}
++
++egl::Error WindowSurfaceVkXcb::swap(const gl::Context *context, SurfaceSwapFeedback *feedback)
++{
++    ContextVk *contextVk   = vk::GetImpl(context);
++    DisplayVk *displayVk   = vk::GetImpl(context->getDisplay());
++    vk::Renderer *renderer = displayVk->getRenderer();
++
++    ANGLE_TRY(angle::ToEGL(contextVk->finishImpl(QueueSubmitReason::EGLSwapBuffers),
++                           EGL_BAD_SURFACE));
++
++    int32_t newW = mWidth;
++    int32_t newH = mHeight;
++    if (queryWindowGeometry(&newW, &newH) && (newW != mWidth || newH != mHeight))
++    {
++        destroyAhbRing(renderer->getDevice());
++        mColorAttachment.destroy(context->getDisplay());
++        mDepthStencilAttachment.destroy(context->getDisplay());
++        mWidth  = newW;
++        mHeight = newH;
++        ANGLE_TRY(angle::ToEGL(OffscreenSurfaceVk::initializeImpl(displayVk), EGL_BAD_SURFACE));
++        return egl::NoError();
++    }
++
++    if (!presentViaDri3(renderer, &mColorAttachment.image))
++    {
++        presentViaPutImage(context);
++    }
++
++    return egl::NoError();
++}
++
++}  // namespace rx
++#else
+ namespace rx
+ {
+ 
+@@ -62,7 +647,7 @@
+         xcb_get_window_attributes_reply(mXcbConnection, cookie, &error);
+     if (error)
+     {
+-        free(reply);
++        free(error);
+         ANGLE_VK_CHECK(context, false, VK_ERROR_INITIALIZATION_FAILED);
+     }
+     *isVisibleOut = (reply->map_state == XCB_MAP_STATE_VIEWABLE);
+@@ -71,3 +656,4 @@
+ }
+ 
+ }  // namespace rx
++#endif

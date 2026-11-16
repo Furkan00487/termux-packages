@@ -266,6 +266,8 @@ ozone_platform_x11 = true
 ozone_platform_wayland = true
 ozone_platform_headless = true
 angle_enable_vulkan = true
+angle_use_custom_libvulkan = false
+concurrent_links = 1
 angle_enable_swiftshader = true
 angle_enable_abseil = false
 # Disable vulkan validation layers, which is almost useless
