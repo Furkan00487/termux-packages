@@ -111,6 +111,9 @@ EOF
 	local _amd64_sysroot_path="$(pwd)/build/linux/$(ls build/linux | grep 'amd64-sysroot')"
 	mkdir -p "$_amd64_sysroot_path/data/data/com.termux/files"
 	ln -sfn ../../../../usr "$_amd64_sysroot_path/data/data/com.termux/files/usr"
+	mkdir -p "$_amd64_sysroot_path/usr/lib/glib-2.0" "$_amd64_sysroot_path/usr/lib/dbus-1.0"
+	ln -sfn ../x86_64-linux-gnu/glib-2.0/include "$_amd64_sysroot_path/usr/lib/glib-2.0/include"
+	ln -sfn ../x86_64-linux-gnu/dbus-1.0/include "$_amd64_sysroot_path/usr/lib/dbus-1.0/include"
 
 	# Setup rust toolchain and clang toolchain
 	./tools/rust/update_rust.py
