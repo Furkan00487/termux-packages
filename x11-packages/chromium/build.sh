@@ -114,6 +114,10 @@ EOF
 	mkdir -p "$_amd64_sysroot_path/usr/lib/glib-2.0" "$_amd64_sysroot_path/usr/lib/dbus-1.0"
 	ln -sfn ../x86_64-linux-gnu/glib-2.0/include "$_amd64_sysroot_path/usr/lib/glib-2.0/include"
 	ln -sfn ../x86_64-linux-gnu/dbus-1.0/include "$_amd64_sysroot_path/usr/lib/dbus-1.0/include"
+	for _nspr_item in "$_amd64_sysroot_path"/usr/include/nspr/*; do
+		[ -e "$_amd64_sysroot_path/usr/include/$(basename "$_nspr_item")" ] && [ ! -L "$_amd64_sysroot_path/usr/include/$(basename "$_nspr_item")" ] || \
+			ln -sfn "nspr/$(basename "$_nspr_item")" "$_amd64_sysroot_path/usr/include/$(basename "$_nspr_item")"
+	done
 
 	# Setup rust toolchain and clang toolchain
 	./tools/rust/update_rust.py
