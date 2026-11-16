@@ -46,3 +46,6 @@ scripts/apt-packages-list-*.txt
 
 # macOS Finder metadata
 .DS_Store
+
+# Local git worktrees
+.worktrees/
