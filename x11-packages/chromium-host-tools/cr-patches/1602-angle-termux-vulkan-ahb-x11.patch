@@ -71,7 +71,7 @@
  bool IsVulkanXcbDisplayAvailable()
 --- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.h	2026-11-16 04:49:56.536845278 +0000
 +++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.h	2026-11-16 04:49:56.536845278 +0000
-@@ -13,10 +13,56 @@
+@@ -13,10 +13,57 @@
  #include "libANGLE/renderer/vulkan/SurfaceVk.h"
  
  struct xcb_connection_t;
@@ -106,7 +106,7 @@
 +        bool initialized      = false;
 +    };
 +
-+    bool queryWindowGeometry(int32_t *outWidth, int32_t *outHeight) const;
++    bool queryWindowGeometry(int32_t *outWidth, int32_t *outHeight, uint8_t *outDepth = nullptr) const;
 +    bool ensureAhbRing(vk::Renderer *renderer);
 +    void destroyAhbRing(VkDevice device);
 +    bool presentViaDri3(vk::Renderer *renderer, vk::ImageHelper *srcImage);
@@ -114,6 +114,7 @@
 +
 +    xcb_connection_t *mXcbConnection;
 +    uint32_t mWindow;
++    uint8_t mWindowDepth = 24;
 +    uint32_t mGc = 0;
 +    VkCommandPool mCmdPool = VK_NULL_HANDLE;
 +    VkCommandBuffer mCmdBuf = VK_NULL_HANDLE;
@@ -138,13 +139,14 @@
  
 --- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.cpp	2026-11-16 04:49:56.536845278 +0000
 +++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/xcb/WindowSurfaceVkXcb.cpp	2026-11-16 05:46:53.132809943 +0000
-@@ -11,6 +11,591 @@
+@@ -11,6 +11,610 @@
  
  #include "libANGLE/renderer/vulkan/vk_renderer.h"
  
 +#if defined(__TERMUX__)
 +#include <android/hardware_buffer.h>
 +#include <dlfcn.h>
++#include <poll.h>
 +#include <sys/socket.h>
 +#include <unistd.h>
 +#include <vulkan/vulkan_android.h>
@@ -174,6 +176,7 @@
 +                                                               uint8_t,
 +                                                               uint16_t,
 +                                                               uint16_t,
++                                                               uint32_t,
 +                                                               uint32_t,
 +                                                               uint32_t,
 +                                                               uint32_t,
@@ -219,10 +222,10 @@
 +                   presentPixmap;
 +        }
 +        loaded       = true;
-+        void *libAnd = dlopen("libandroid.so", RTLD_LAZY);
++        void *libAnd = dlopen("/system/lib64/libandroid.so", RTLD_LAZY);
 +        if (!libAnd)
 +        {
-+            libAnd = dlopen("/system/lib64/libandroid.so", RTLD_LAZY);
++            libAnd = dlopen("libandroid.so", RTLD_LAZY);
 +        }
 +        if (libAnd)
 +        {
@@ -236,7 +239,12 @@
 +        if (libDri3)
 +        {
 +            dri3PixmapFromBuffers = reinterpret_cast<PFN_dri3_pixmap_from_buffers>(
-+                dlsym(libDri3, "xcb_dri3_pixmap_from_buffers"));
++                dlsym(libDri3, "xcb_dri3_pixmap_from_buffers_checked"));
++            if (!dri3PixmapFromBuffers)
++            {
++                dri3PixmapFromBuffers = reinterpret_cast<PFN_dri3_pixmap_from_buffers>(
++                    dlsym(libDri3, "xcb_dri3_pixmap_from_buffers"));
++            }
 +        }
 +        void *libPres = dlopen("libxcb-present.so", RTLD_LAZY);
 +        if (libPres)
@@ -288,7 +296,9 @@
 +
 +WindowSurfaceVkXcb::~WindowSurfaceVkXcb() = default;
 +
-+bool WindowSurfaceVkXcb::queryWindowGeometry(int32_t *outWidth, int32_t *outHeight) const
++bool WindowSurfaceVkXcb::queryWindowGeometry(int32_t *outWidth,
++                                               int32_t *outHeight,
++                                               uint8_t *outDepth) const
 +{
 +    xcb_get_geometry_cookie_t cookie = xcb_get_geometry(mXcbConnection, mWindow);
 +    xcb_generic_error_t *error       = nullptr;
@@ -304,6 +314,10 @@
 +    }
 +    *outWidth  = reply->width > 0 ? static_cast<int32_t>(reply->width) : 1;
 +    *outHeight = reply->height > 0 ? static_cast<int32_t>(reply->height) : 1;
++    if (outDepth)
++    {
++        *outDepth = reply->depth > 0 ? reply->depth : 24;
++    }
 +    free(reply);
 +    return true;
 +}
@@ -312,12 +326,14 @@
 +{
 +    int32_t w = 1;
 +    int32_t h = 1;
-+    if (!queryWindowGeometry(&w, &h))
++    uint8_t d = 24;
++    if (!queryWindowGeometry(&w, &h, &d))
 +    {
 +        return egl::Error(EGL_BAD_NATIVE_WINDOW);
 +    }
-+    mWidth  = w;
-+    mHeight = h;
++    mWidth       = w;
++    mHeight      = h;
++    mWindowDepth = d;
 +    return OffscreenSurfaceVk::initialize(display);
 +}
 +
@@ -544,16 +560,19 @@
 +        }
 +
 +        xcb_pixmap_t pixmap = xcb_generate_id(mXcbConnection);
++        uint8_t depth       = (mWindowDepth == 32) ? 32 : 24;
++        uint8_t bpp         = 32;
 +        // Modifier 1255 = AHARDWAREBUFFER_SOCKET_FD in Termux:X11 (Lorie) InitOutput.c
 +        xcb_void_cookie_t ck = api.dri3PixmapFromBuffers(
 +            mXcbConnection, pixmap, mWindow, 1, static_cast<uint16_t>(mWidth),
-+            static_cast<uint16_t>(mHeight), desc.stride * 4, 0, 0, 0, 0, 0, 0, 32, 24,
++            static_cast<uint16_t>(mHeight), desc.stride * 4, 0, 0, 0, 0, 0, 0, 0, depth, bpp,
 +            1255ULL, &sv[1]);
 +        xcb_flush(mXcbConnection);
 +
-+        uint8_t ack = 0;
-+        ssize_t n   = read(sv[0], &ack, 1);
-+        int sendRes = (n == 1) ? api.sendHandle(mRing[i].ahb, sv[0]) : -1;
++        struct pollfd pfd = {sv[0], POLLIN, 0};
++        uint8_t ack       = 0;
++        ssize_t n         = (poll(&pfd, 1, 2000) > 0) ? read(sv[0], &ack, 1) : -1;
++        int sendRes       = (n == 1) ? api.sendHandle(mRing[i].ahb, sv[0]) : -1;
 +        close(sv[0]);
 +
 +        xcb_generic_error_t *driErr = xcb_request_check(mXcbConnection, ck);
@@ -688,7 +707,8 @@
 +        xcb_create_gc(mXcbConnection, mGc, mWindow, 0, nullptr);
 +    }
 +    xcb_put_image(mXcbConnection, XCB_IMAGE_FORMAT_Z_PIXMAP, mWindow, mGc,
-+                  static_cast<uint16_t>(mWidth), static_cast<uint16_t>(mHeight), 0, 0, 0, 24,
++                  static_cast<uint16_t>(mWidth), static_cast<uint16_t>(mHeight), 0, 0, 0,
++                  mWindowDepth,
 +                  static_cast<uint32_t>(pitch * mHeight), pixels);
 +    xcb_flush(mXcbConnection);
 +    (void)OffscreenSurfaceVk::unlockSurface(context->getDisplay(), false);
@@ -730,7 +750,7 @@
  namespace rx
  {
  
-@@ -62,7 +647,7 @@
+@@ -62,7 +666,7 @@
          xcb_get_window_attributes_reply(mXcbConnection, cookie, &error);
      if (error)
      {
