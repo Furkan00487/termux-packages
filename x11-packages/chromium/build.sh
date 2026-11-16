@@ -426,7 +426,9 @@ termux_step_make_install() {
 
 	cp "${normal_files[@]/#/out/Release/}" "$TERMUX_PREFIX/lib/chromium/"
 
-	cp -Rf out/Release/angledata $TERMUX_PREFIX/lib/chromium/
+	if [ -d out/Release/angledata ]; then
+		cp -Rf out/Release/angledata $TERMUX_PREFIX/lib/chromium/
+	fi
 	cp -Rf out/Release/locales $TERMUX_PREFIX/lib/chromium/
 	cp -Rf out/Release/MEIPreload $TERMUX_PREFIX/lib/chromium/
 	cp -Rf out/Release/resources $TERMUX_PREFIX/lib/chromium/
